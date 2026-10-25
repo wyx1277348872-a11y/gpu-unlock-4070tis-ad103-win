@@ -1,10 +1,12 @@
-# RTX 4090 算力解锁（Windows）
+# Windows 算力解锁 — RTX 4070 Ti SUPER (AD103) 移植
 
-[English](README.md)
+[English](README.md) · **[10de:2705 移植说明](PORT-2705.md)**
 
-一个带图形界面和开关的 Windows 一键安装器。每次开机时，在 Windows 加载 NVIDIA 驱动**之前**，它会把 GeForce RTX 4090（24 GB）上被限速的 **FP32 累加张量核心**打开到满速。
+本仓库是 [Zihao-Wu06/gpu-unlock-for-windows](https://github.com/Zihao-Wu06/gpu-unlock-for-windows) 的移植分支，在原有 RTX 4090 目标之外，新增了 **RTX 4070 Ti SUPER（`10de:2705`，AD103，16 GB）** 的已验证 profile。它会在 Windows 加载 NVIDIA 驱动**之前**运行一个 UEFI 程序，把这一开机周期内的 FP32 累加张量核心恢复到满速，然后交回 Windows Boot Manager。
 
-> **实验性软件，只在一台电脑上验证过。** 它会修改固件启动顺序，并在每次开机时对显卡写寄存器。请先读[风险](#风险)，使用风险自负。
+> **实验性软件，只在一台电脑、一张卡、四次冷启动上验证过。** 它会修改固件启动顺序，并在每次开机时对显卡写寄存器。请先读[风险](#风险)，使用风险自负。
+
+**本仓库只发布源码**，不包含预编译 EFI，也不包含 NVIDIA 固件。实测数据、改动细节与构建步骤见 [PORT-2705.md](PORT-2705.md)。
 
 ![主界面](docs/images/main-zh.png)
 

@@ -1,0 +1,36 @@
+# NVIDIA firmware and anything generated from it: never commit (see NOTICE.md)
+*.bin
+*.BIN
+*.rom
+*.ROM
+*.tar.xz
+*.pkg.tar.zst
+python-*-embed-*.zip
+GPU-UNLOCK/
+ASSETS/
+cache/
+staging/
+
+# Per-card data and boot logs (identify one user's card and PC)
+PROFILE.TXT
+REPORT.TXT
+RUN[0-9][0-9]/
+probe-run*/
+capture/
+*.log
+bench-*.json
+
+# Build output
+build/
+out*/
+zig-cache/
+.zig-cache/
+__pycache__/
+*.pyc
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

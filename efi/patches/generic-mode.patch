@@ -1,0 +1,411 @@
+diff --git a/windows/build.py b/windows/build.py
+index bc8bdd0..7aff56a 100644
+--- a/windows/build.py
++++ b/windows/build.py
+@@ -114,7 +114,7 @@ def inspect_pe(data: bytes) -> dict:
+ 
+ def main():
+     parser = argparse.ArgumentParser(description=__doc__)
+-    parser.add_argument("mode", choices=["probe", "unlock"])
++    parser.add_argument("mode", choices=["probe", "unlock", "generic"])
+     parser.add_argument("--zig", default="zig", help="path to Zig 0.15.2 executable")
+     parser.add_argument("--run", type=Path, help="GPU-UNLOCK/RUNxx directory from the probe")
+     parser.add_argument("--output", type=Path)
+@@ -134,6 +134,8 @@ def main():
+     (output / "EFI/BOOT").mkdir(parents=True)
+     if profile:
+         (output / "board_profile.h").write_text(profile_header(profile), encoding="ascii")
++    if args.mode == "generic":
++        shutil.copyfile(UEFI / "board_profile_generic.h", output / "board_profile.h")
+     sources = COMMON + (["probe", "boot_tests", "checks", "ownership", "vendor/vbios_610", "vendor/gfw_eval"]
+                         if args.mode == "probe" else ["app", "ownership", "checks"] + CORE)
+     image = output / "EFI/BOOT/BOOTX64.EFI"
+@@ -143,6 +145,10 @@ def main():
+              "-DGU_UEFI_PORT", "-DGU_TARGET_PCI_ID=0x268410deU", "-nostdlib"]
+     if args.mode == "probe":
+         flags.append("-DGU_PROBE_ONLY")
++    else:
++        flags.append("-DGU_AUTO")
++    if args.mode == "generic":
++        flags.append("-DGU_GENERIC")
+     includes = [output, UEFI, UEFI / "compat", UEFI / "edk2/MdePkg/Include",
+                 UEFI / "edk2/MdePkg/Include/X64"]
+     subprocess.run([args.zig, "cc", *flags, *(f"-I{p}" for p in includes),
+diff --git a/windows/uefi/app.c b/windows/uefi/app.c
+index f742379..5edbb1c 100644
+--- a/windows/uefi/app.c
++++ b/windows/uefi/app.c
+@@ -10,6 +10,8 @@
+ #include "ownership.h"
+ #include "state_checks.h"
+ #include "security.h"
++#include "format.h"
++#include <stdarg.h>
+ #include "vendor/unlock_610.h"
+ #include "vendor/gfw_eval.h"
+ #include <Protocol/GraphicsOutput.h>
+@@ -197,7 +199,9 @@ static EFI_STATUS ColdCheck(VOID) {
+      value up: the transaction independently uses the actual FB size. */
+   GuLog("VRAM register=%#x (%u MiB); must match board profile; layout uses actual register\n",vram,vram);
+   if(Gu.fault || gpu_unlock_gfw_assess(&s) || hi>>4 || plm!=0xffffff8f ||
+-    !GuColdSelectors(ss0,ss1) || ss1!=GU_COLD_SS1 || (vram!=GU_VRAM_MIB))return EFI_NOT_READY;
++    /* Local change: SS1's low bits (override disabled) vary between boots, so only
++       GuColdSelectors' bit-3-clear / <=7 rule applies, not the probe-time value. */
++    !GuColdSelectors(ss0,ss1) || (vram!=GU_VRAM_MIB))return EFI_NOT_READY;
+   return Gu.fault?EFI_DEVICE_ERROR:EFI_SUCCESS;
+ }
+ static VOID LogHash(const char *Name,const VOID *Data,UINTN Bytes) {
+@@ -226,7 +230,173 @@ static EFI_STATUS PromCheck(VOID) {
+   }
+   GuFree(prom);return good?EFI_SUCCESS:Gu.fault?EFI_DEVICE_ERROR:EFI_CRC_ERROR;
+ }
++#ifdef GU_GENERIC
++GU_PROFILE GuProfile;
++static UINTN Fmt(char *Buffer,UINTN Size,const char *Format,...) {
++  va_list args;va_start(args,Format);size_t n=GuFormatV(Buffer,Size,Format,args);va_end(args);
++  return n>=Size?0:(UINTN)n;
++}
++static BOOLEAN StrEq(const char *A,const char *B) {while(*A && *A==*B){A++;B++;}return *A==*B;}
++static BOOLEAN ParseNumber(const char *S,UINT32 *Out) {
++  UINT64 v=0;UINTN digits=0;UINT32 base=10;
++  if(S[0]=='0' && (S[1]=='x' || S[1]=='X')){base=16;S+=2;}
++  for(;*S;S++) {
++    UINT32 d;
++    if(*S>='0' && *S<='9')d=(UINT32)(*S-'0');
++    else if(base==16 && *S>='a' && *S<='f')d=(UINT32)(*S-'a'+10);
++    else if(base==16 && *S>='A' && *S<='F')d=(UINT32)(*S-'A'+10);
++    else return FALSE;
++    v=v*base+d;if(v>0xffffffffULL)return FALSE;digits++;
++  }
++  *Out=(UINT32)v;return digits>0;
++}
++static BOOLEAN ParseSha(const char *S,char Out[65]) {
++  UINTN n=0;
++  for(;S[n];n++) {
++    if(n>=64 || !((S[n]>='0' && S[n]<='9') || (S[n]>='a' && S[n]<='f')))return FALSE;
++  }
++  if(n!=64)return FALSE;
++  for(UINTN i=0;i<64;i++)Out[i]=S[i];
++  Out[64]=0;return TRUE;
++}
++typedef EFI_STATUS (*PairFn)(const char *Key,const char *Value,VOID *Context);
++/* Strict "key=value" lines; '#' starts a comment line. Any malformed line is an error. */
++static EFI_STATUS ForEachPair(char *Text,PairFn Fn,VOID *Context) {
++  char *line=Text;
++  while(*line) {
++    char *end=line;while(*end && *end!='\n')end++;
++    char *next=*end?end+1:end;*end=0;
++    char *a=line;while(*a==' ' || *a=='\t')a++;
++    char *b=a;while(*b)b++;
++    while(b>a && (b[-1]=='\r' || b[-1]==' ' || b[-1]=='\t')){b--;*b=0;}
++    if(*a && *a!='#') {
++      char *eq=a;while(*eq && *eq!='=')eq++;
++      if(*eq!='=')return EFI_COMPROMISED_DATA;
++      *eq=0;
++      char *ke=eq;while(ke>a && (ke[-1]==' ' || ke[-1]=='\t')){ke--;*ke=0;}
++      char *v=eq+1;while(*v==' ' || *v=='\t')v++;
++      EFI_STATUS s=Fn(a,v,Context);if(EFI_ERROR(s))return s;
++    }
++    line=next;
++  }
++  return EFI_SUCCESS;
++}
++typedef struct {UINT32 seen,version;GU_PROFILE p;} PROFILE_CTX;
++static EFI_STATUS ProfilePair(const char *K,const char *V,VOID *C) {
++  PROFILE_CTX *x=C;
++  static const char *const names[13]={"version","segment","bus","device","function","subsystem","class_revision",
++    "bar0","bar_granularity","vram_mib","rom_bytes","rom_sha256","prom_sha256"};
++  UINT32 *dst[11]={&x->version,&x->p.segment,&x->p.bus,&x->p.device,&x->p.function,&x->p.subsystem,
++    &x->p.class_revision,&x->p.bar0,&x->p.bar_granularity,&x->p.vram_mib,&x->p.rom_bytes};
++  for(UINTN i=0;i<13;i++) {
++    if(!StrEq(K,names[i]))continue;
++    if(x->seen&(1U<<i))return EFI_COMPROMISED_DATA;
++    BOOLEAN ok=i<11?ParseNumber(V,dst[i]):ParseSha(V,i==11?x->p.rom_sha256:x->p.prom_sha256);
++    if(!ok)return EFI_COMPROMISED_DATA;
++    x->seen|=1U<<i;return EFI_SUCCESS;
++  }
++  return EFI_COMPROMISED_DATA;
++}
++/* Same plausibility rules the enrollment applies; a hand-edited or damaged file is rejected. */
++static BOOLEAN ProfileValid(const PROFILE_CTX *x) {
++  const GU_PROFILE *p=&x->p;
++  return x->seen==0x1fffU && x->version==1 && p->segment<=0xffff && p->bus<=255 && p->device<=31 && p->function<=7 &&
++    p->subsystem!=0 && p->subsystem!=0xffffffffU && (p->class_revision>>24)==3 &&
++    p->bar0!=0 && !(p->bar0&0xffffffU) && (p->bar_granularity==32 || p->bar_granularity==64) &&
++    p->vram_mib>=24512 && p->vram_mib<=24576 && p->rom_bytes>0 && p->rom_bytes<=16U*1048576U;
++}
++static EFI_STATUS LoadProfile(VOID) {
++  char buffer[2048];UINTN length=0;PROFILE_CTX ctx;
++  memset(&ctx,0,sizeof(ctx));
++  EFI_STATUS status=GuReadParentFile(L"PROFILE.TXT",buffer,sizeof(buffer),&length);
++  if(EFI_ERROR(status))return status;
++  status=ForEachPair(buffer,ProfilePair,&ctx);
++  if(EFI_ERROR(status) || !ProfileValid(&ctx)){GuLogText("profile: PROFILE.TXT is malformed or implausible; delete it to enroll again\n");return EFI_COMPROMISED_DATA;}
++  GuProfile=ctx.p;
++  GuLog("profile: bdf=%u:%u:%u.%u subsystem=%#x class_rev=%#x bar0=%#x vram=%u MiB rom_bytes=%u\n",
++    GuProfile.segment,GuProfile.bus,GuProfile.device,GuProfile.function,GuProfile.subsystem,
++    GuProfile.class_revision,GuProfile.bar0,GuProfile.vram_mib,GuProfile.rom_bytes);
++  return EFI_SUCCESS;
++}
++static VOID Hex(const UINT8 Digest[32],char Out[65]) {
++  static const char digits[]="0123456789abcdef";
++  for(UINTN i=0;i<32;i++){Out[2*i]=digits[Digest[i]>>4];Out[2*i+1]=digits[Digest[i]&15];}
++  Out[64]=0;
++}
++/* Enrollment boot: ONLY reads the card (config space, BAR0 registers, option ROM, PROM view) and writes
++ * \GPU-UNLOCK\PROFILE.TXT on the program's own partition. No GPU write, no DMA, no driver release. */
++static EFI_STATUS Enroll(VOID) {
++  EFI_HANDLE *handles=NULL;UINTN count=0,matches=0;
++  EFI_STATUS status=Gu.bs->LocateHandleBuffer(ByProtocol,&PciGuid,NULL,&count,&handles);
++  if(!EFI_ERROR(status) && (!handles || !count || count>256))status=EFI_COMPROMISED_DATA;
++  for(UINTN i=0;!EFI_ERROR(status) && i<count;i++) {
++    EFI_PCI_IO_PROTOCOL *pci=NULL;UINT32 id=0;
++    status=Gu.bs->HandleProtocol(handles[i],&PciGuid,(VOID **)&pci);
++    if(!EFI_ERROR(status) && pci)status=pci->Pci.Read(pci,EfiPciIoWidthUint32,0,1,&id);
++    else if(!EFI_ERROR(status))status=EFI_COMPROMISED_DATA;
++    if(!EFI_ERROR(status) && id==GU_BOARD_ID){matches++;Gu.pci=pci;Gu.handle=handles[i];}
++  }
++  GuFree(handles);
++  if(EFI_ERROR(status))return status;
++  if(matches!=1){GuLog("enroll: need exactly one RTX 4090 (10de:2684), found %zu\n",(size_t)matches);return EFI_UNSUPPORTED;}
++  UINT32 config[64];UINTN segment,bus,device,function;
++  status=Gu.pci->GetLocation(Gu.pci,&segment,&bus,&device,&function);if(EFI_ERROR(status))return status;
++  status=ReadConfig(config);if(EFI_ERROR(status))return status;
++  if(config[0]!=GU_BOARD_ID || (config[2]>>24)!=3 || (config[1]&6)!=2 || (config[3]&0x7f0000U) || (config[12]&1)) {
++    GuLog("enroll: PCI state not suitable: id=%#x class=%#x command=%#x header=%#x rombar=%#x\n",config[0],config[2],config[1],config[3],config[12]);
++    return EFI_UNSUPPORTED;
++  }
++  if((config[4]&0xfU) || !config[4] || (config[4]&0xffffffU)){GuLog("enroll: BAR0 is not a 16 MiB aligned 32-bit memory BAR (%#x)\n",config[4]);return EFI_UNSUPPORTED;}
++  EFI_ACPI_ADDRESS_SPACE_DESCRIPTOR *bar=NULL;
++  status=Gu.pci->GetBarAttributes(Gu.pci,0,NULL,(VOID **)&bar);
++  if(EFI_ERROR(status))return status;
++  if(!bar || bar->Desc!=ACPI_ADDRESS_SPACE_DESCRIPTOR || bar->Len!=sizeof(*bar)-3 || bar->ResType || bar->AddrTranslationOffset ||
++     bar->AddrLen!=GU_BAR_SIZE || bar->AddrRangeMin!=config[4] || (bar->AddrSpaceGranularity!=32 && bar->AddrSpaceGranularity!=64)) {
++    GuLogText("enroll: BAR0 descriptor does not match the expected 16 MiB window\n");GuFree(bar);return EFI_UNSUPPORTED;
++  }
++  UINT32 granularity=(UINT32)bar->AddrSpaceGranularity;
++  Gu.bar_base=bar->AddrRangeMin;Gu.bar_size=bar->AddrLen;GuFree(bar);
++  UINT32 chip=GuRead32(0),vram=GuRead32(0x1183a4),wpr2=GuRead32(0x1fa828),ss0=GuRead32(GU_FEAT_SS0_OFFSET),ss1=GuRead32(0x823820),plm=GuRead32(GU_FEAT_PLM_OFFSET);
++  GuLog("enroll: chip=%#x vram=%u MiB wpr2_hi=%#x ss0=%#x ss1=%#x plm=%#x\n",chip,vram,wpr2,ss0,ss1,plm);
++  if(Gu.fault || chip!=GU_BOARD_CHIP){GuLogText("enroll: chip id does not match an RTX 4090 (AD102)\n");return EFI_UNSUPPORTED;}
++  if((wpr2>>4) || plm!=0xffffff8fU || !GuColdSelectors(ss0,ss1) || vram<24512 || vram>24576) {
++    GuLogText("enroll: the card is not in the expected cold, locked, 24 GB state; not enrolling\n");return EFI_NOT_READY;
++  }
++  if(!Gu.pci->RomImage || !Gu.pci->RomSize || Gu.pci->RomSize>16U*1048576U){GuLogText("enroll: no usable option ROM image\n");return EFI_UNSUPPORTED;}
++  const UINT8 *rom=Gu.pci->RomImage;
++  if(rom[0]!=0x55 || rom[1]!=0xaa){GuLogText("enroll: option ROM has no 55AA signature\n");return EFI_UNSUPPORTED;}
++  UINT8 digest[32];char rom_hex[65],prom_hex[65];
++  GuSha256(Gu.pci->RomImage,(UINTN)Gu.pci->RomSize,digest);Hex(digest,rom_hex);
++  UINT8 *prom=GuAlloc(GU_PROM_VIEW_BYTES),*again=GuAlloc(GU_PROM_VIEW_BYTES);
++  if(!prom || !again){GuFree(prom);GuFree(again);return EFI_OUT_OF_RESOURCES;}
++  GuCopyFromIo(prom,(VOID *)(UINTN)(Gu.bar_base+GU_PROM_BAR_OFFSET),GU_PROM_VIEW_BYTES);
++  GuCopyFromIo(again,(VOID *)(UINTN)(Gu.bar_base+GU_PROM_BAR_OFFSET),GU_PROM_VIEW_BYTES);
++  BOOLEAN stable=!Gu.fault && prom[0]==0x55 && prom[1]==0xaa && !memcmp(prom,again,GU_PROM_VIEW_BYTES);
++  GuSha256(prom,GU_PROM_VIEW_BYTES,digest);Hex(digest,prom_hex);
++  GuFree(prom);GuFree(again);
++  if(!stable){GuLogText("enroll: PROM view unreadable or not stable between two reads\n");return EFI_DEVICE_ERROR;}
++  char text[1024];
++  UINTN n=Fmt(text,sizeof(text),
++    "# Written by the generic GPU unlock preboot program on its enrollment boot. Delete this file to enroll again.\n"
++    "version=1\nsegment=%u\nbus=%u\ndevice=%u\nfunction=%u\nsubsystem=%#x\nclass_revision=%#x\nbar0=%#x\nbar_granularity=%u\n"
++    "vram_mib=%u\nrom_bytes=%u\nrom_sha256=%s\nprom_sha256=%s\n",
++    (unsigned)segment,(unsigned)bus,(unsigned)device,(unsigned)function,config[11],config[2],config[4],(unsigned)granularity,
++    (unsigned)vram,(unsigned)Gu.pci->RomSize,rom_hex,prom_hex);
++  if(!n)return EFI_BUFFER_TOO_SMALL;
++  status=GuSaveParentBlob(L"PROFILE.TXT",text,n);
++  GuLog("enroll: PROFILE.TXT save status=%#llx bytes=%zu\n",(unsigned long long)status,(size_t)n);
++  if(EFI_ERROR(status))return status;
++  status=LoadProfile();  /* read it back through the same strict parser the unlock path uses */
++  return status;
++}
++#endif
+ static EFI_STATUS Arm(VOID) {
++#ifdef GU_AUTO
++  /* No countdown (fixed at zero): the unlock starts at once. To skip it for one start, pick "Windows Boot Manager"
++     in the firmware boot menu; to stop it for good, turn the switch OFF in Windows. */
++  GuLogText("AUTO MODE: no countdown; the unlock starts now.\n");
++  return GuLogReady()?EFI_SUCCESS:EFI_DEVICE_ERROR;
++#endif
+   if(!Table->ConIn || !Table->ConIn->Reset || !Table->ConIn->ReadKeyStroke)return EFI_UNSUPPORTED;
+   EFI_STATUS status=Table->ConIn->Reset(Table->ConIn,FALSE);if(EFI_ERROR(status))return status;
+   GuLogText("READY: RTX 4090 AD102 experimental preboot port / Windows preloaded.\n");
+@@ -245,6 +415,11 @@ static EFI_STATUS Arm(VOID) {
+ }
+ static VOID PausePreflightFailure(VOID) {
+   if(GuScreenDetached || Gu.started || !Table->ConIn || !Table->ConIn->ReadKeyStroke)return;
++#ifdef GU_AUTO
++  GuConsole("Preflight stopped before unlock; continuing to Windows without it. See the newest RUNxx/REPORT.TXT.\n");
++  Gu.bs->Stall(3000000);
++  return;
++#endif
+   if(Table->ConIn->Reset)Table->ConIn->Reset(Table->ConIn,FALSE);
+   GuConsole("Preflight stopped before unlock. See the FINAL stage above and REPORT.TXT.\n");
+   GuConsole("Press Enter or Esc to return to firmware; automatic return in 60 seconds. U cannot start an attempt here.\n");
+@@ -293,6 +468,17 @@ EFI_STATUS EFIAPI EfiMain(EFI_HANDLE Image,EFI_SYSTEM_TABLE *St) {
+     (unsigned)secure,(unsigned long long)status);
+   status=Step(status);if(EFI_ERROR(status))goto finish;
+   Stage="watchdog";status=Step(Gu.bs->SetWatchdogTimer(0,0,0,NULL));if(EFI_ERROR(status))goto finish;
++#ifdef GU_GENERIC
++  Stage="profile";status=LoadProfile();
++  if(status==EFI_NOT_FOUND) {
++    GuLogText("ENROLLMENT: no PROFILE.TXT yet. First the card is only READ and its profile saved (no GPU write).\n");
++    Stage="enroll";status=Step(Enroll());
++    if(EFI_ERROR(status))goto finish;
++    GuLogText("ENROLLED: PROFILE.TXT written and read back. Continuing with the normal unlock checks in this same boot.\n");
++  } else {
++    status=Step(status);if(EFI_ERROR(status))goto finish;
++  }
++#endif
+   Stage="target";status=Step(FindTarget());if(EFI_ERROR(status))goto finish;
+   Stage="display";Gu.display_ok=DisplayCheck();status=Step(Gu.display_ok?EFI_SUCCESS:EFI_UNSUPPORTED);if(EFI_ERROR(status))goto finish;
+   Stage="ownership";status=GuClaimController();
+diff --git a/windows/uefi/app_io.c b/windows/uefi/app_io.c
+index fdf2d2c..9869b8d 100644
+--- a/windows/uefi/app_io.c
++++ b/windows/uefi/app_io.c
+@@ -46,6 +46,7 @@ VOID GuLog(const char *Format,...) {
+   GuLogText(text);
+ }
+ BOOLEAN GuLogReady(VOID){return Report && !LogFault;}
++#ifndef GU_AUTO
+ static BOOLEAN UsbPath(EFI_HANDLE Handle) {
+   EFI_DEVICE_PATH_PROTOCOL *path=NULL;
+   if(EFI_ERROR(Table->BootServices->HandleProtocol(Handle,&PathGuid,(VOID **)&path)) || !path)return FALSE;
+@@ -61,6 +62,7 @@ static BOOLEAN UsbPath(EFI_HANDLE Handle) {
+   }
+   return FALSE;
+ }
++#endif
+ static EFI_STATUS Metadata(EFI_FILE_PROTOCOL *File,BOOLEAN Directory,UINTN Expected) {
+   union {EFI_FILE_INFO info;UINT8 bytes[512];} data;UINTN n=sizeof(data);
+   EFI_STATUS status=File->GetInfo(File,&InfoGuid,&n,&data);
+@@ -70,17 +72,76 @@ static EFI_STATUS Metadata(EFI_FILE_PROTOCOL *File,BOOLEAN Directory,UINTN Expec
+     (!Directory && data.info.FileSize!=Expected))return EFI_COMPROMISED_DATA;
+   return EFI_SUCCESS;
+ }
++#ifdef GU_AUTO
++static BOOLEAN TimeBefore(const EFI_TIME *A,const EFI_TIME *B) {
++  if(A->Year!=B->Year)return A->Year<B->Year;
++  if(A->Month!=B->Month)return A->Month<B->Month;
++  if(A->Day!=B->Day)return A->Day<B->Day;
++  if(A->Hour!=B->Hour)return A->Hour<B->Hour;
++  if(A->Minute!=B->Minute)return A->Minute<B->Minute;
++  return A->Second<B->Second;
++}
++/* Unattended boots reuse RUN00..RUN07 (oldest report first), so the log never fills the volume. */
++static EFI_STATUS OpenAutoRun(VOID) {
++  (void)PathGuid; /* only the USB-only path check used it */
++  UINTN pick=0;BOOLEAN found_free=FALSE,have=FALSE;EFI_TIME oldest;memset(&oldest,0,sizeof(oldest));
++  for(UINTN slot=0;slot<8 && !found_free;slot++) {
++    CHAR16 probe_name[]=L"RUN00";probe_name[3]=(CHAR16)('0'+slot/10);probe_name[4]=(CHAR16)('0'+slot%10);
++    EFI_FILE_PROTOCOL *dir=NULL,*rep=NULL;
++    EFI_STATUS probe_status=Parent->Open(Parent,&dir,probe_name,EFI_FILE_MODE_READ,0);
++    if(probe_status==EFI_NOT_FOUND){pick=slot;found_free=TRUE;continue;}
++    if(EFI_ERROR(probe_status) || !dir)return EFI_ERROR(probe_status)?probe_status:EFI_DEVICE_ERROR;
++    EFI_TIME stamp;memset(&stamp,0,sizeof(stamp));
++    probe_status=dir->Open(dir,&rep,L"REPORT.TXT",EFI_FILE_MODE_READ,0);
++    if(!EFI_ERROR(probe_status) && rep) {
++      union {EFI_FILE_INFO info;UINT8 bytes[512];} data;UINTN n=sizeof(data);
++      if(!EFI_ERROR(rep->GetInfo(rep,&InfoGuid,&n,&data)))stamp=data.info.ModificationTime;
++      rep->Close(rep);
++    } else if(probe_status!=EFI_NOT_FOUND){dir->Close(dir);return probe_status;}
++    dir->Close(dir);
++    if(!have || TimeBefore(&stamp,&oldest)){oldest=stamp;pick=slot;have=TRUE;}
++  }
++  CHAR16 name[]=L"RUN00";name[3]=(CHAR16)('0'+pick/10);name[4]=(CHAR16)('0'+pick%10);
++  EFI_STATUS status=Parent->Open(Parent,&Run,name,EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE|EFI_FILE_MODE_CREATE,EFI_FILE_DIRECTORY);
++  if(EFI_ERROR(status) || !Run)return EFI_DEVICE_ERROR;
++  status=Metadata(Run,TRUE,0);if(EFI_ERROR(status))return status;
++  EFI_FILE_PROTOCOL *old=NULL;
++  status=Run->Open(Run,&old,L"REPORT.TXT",EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE,0);
++  if(!EFI_ERROR(status) && old) {
++    /* Delete closes the handle; EFI_WARN_DELETE_FAILURE is a warning, not an error code. */
++    status=old->Delete(old);if(status!=EFI_SUCCESS)return EFI_DEVICE_ERROR;
++  } else if(status!=EFI_NOT_FOUND)return status;
++  status=Run->Open(Run,&Report,L"REPORT.TXT",EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE|EFI_FILE_MODE_CREATE,0);
++  if(EFI_ERROR(status) || !Report)return EFI_DEVICE_ERROR;
++  GuLog("RTX 4090 Windows preboot unlock (auto mode)\nRUN%02u\n",(unsigned)pick);
++  return GuLogReady()?EFI_SUCCESS:EFI_DEVICE_ERROR;
++}
++#endif
+ EFI_STATUS GuIoOpen(EFI_HANDLE Image,EFI_SYSTEM_TABLE *St) {
+   Table=St;Root=Parent=Run=Report=NULL;LogFault=FALSE;memset(GuAssets,0,sizeof(GuAssets));
+   EFI_LOADED_IMAGE_PROTOCOL *loaded=NULL;EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs=NULL;
+   EFI_STATUS status=Table->BootServices->HandleProtocol(Image,&LoadedGuid,(VOID **)&loaded);
+-  if(EFI_ERROR(status) || !loaded || !UsbPath(loaded->DeviceHandle))return EFI_UNSUPPORTED;
++  if(EFI_ERROR(status) || !loaded)return EFI_UNSUPPORTED;
++#ifndef GU_AUTO
++  if(!UsbPath(loaded->DeviceHandle))return EFI_UNSUPPORTED;
++#endif
+   status=Table->BootServices->HandleProtocol(loaded->DeviceHandle,&FsGuid,(VOID **)&fs);
+   if(EFI_ERROR(status) || !fs)return EFI_UNSUPPORTED;
+   status=fs->OpenVolume(fs,&Root);if(EFI_ERROR(status) || !Root)return EFI_DEVICE_ERROR;
++#ifdef GU_AUTO
++  /* Auto mode runs from a dedicated internal partition. Never run from, or write logs to,
++     a volume that holds Microsoft's boot files (the Windows ESP). */
++  {EFI_FILE_PROTOCOL *ms=NULL;
++   status=Root->Open(Root,&ms,L"\\EFI\\Microsoft",EFI_FILE_MODE_READ,0);
++   if(!EFI_ERROR(status)){if(ms)ms->Close(ms);return EFI_UNSUPPORTED;}
++   if(status!=EFI_NOT_FOUND)return status;}
++#endif
+   status=Root->Open(Root,&Parent,L"\\GPU-UNLOCK",EFI_FILE_MODE_READ|EFI_FILE_MODE_WRITE,0);
+   if(EFI_ERROR(status) || !Parent)return EFI_NOT_FOUND;
+   status=Metadata(Parent,TRUE,0);if(EFI_ERROR(status))return status;
++#ifdef GU_AUTO
++  return OpenAutoRun();
++#endif
+   for(UINTN slot=0;slot<100;slot++) {
+     CHAR16 name[]=L"RUN00";name[3]=(CHAR16)('0'+slot/10);name[4]=(CHAR16)('0'+slot%10);
+     EFI_FILE_PROTOCOL *existing=NULL;
+@@ -144,6 +205,36 @@ EFI_STATUS GuSaveBlob(CHAR16 *Name,const VOID *Data,UINTN Size) {
+   EFI_STATUS closed=file->Close(file);
+   return EFI_ERROR(status)?status:closed;
+ }
++#ifdef GU_GENERIC
++/* Read a small text file from \GPU-UNLOCK (NUL-terminated, at most Max-1 bytes). */
++EFI_STATUS GuReadParentFile(CHAR16 *Name,char *Out,UINTN Max,UINTN *Length) {
++  EFI_FILE_PROTOCOL *file=NULL;
++  if(!Parent || !Name || !Out || !Max || !Length)return EFI_INVALID_PARAMETER;
++  EFI_STATUS status=Parent->Open(Parent,&file,Name,EFI_FILE_MODE_READ,0);
++  if(status==EFI_NOT_FOUND)return EFI_NOT_FOUND;
++  if(EFI_ERROR(status) || !file)return EFI_ERROR(status)?status:EFI_DEVICE_ERROR;
++  union {EFI_FILE_INFO info;UINT8 bytes[512];} data;UINTN n=sizeof(data);
++  status=file->GetInfo(file,&InfoGuid,&n,&data);
++  if(!EFI_ERROR(status) && ((data.info.Attribute&EFI_FILE_DIRECTORY) || data.info.FileSize==0 || data.info.FileSize>=Max))status=EFI_COMPROMISED_DATA;
++  UINTN size=EFI_ERROR(status)?0:(UINTN)data.info.FileSize,done=0;
++  while(!EFI_ERROR(status) && done<size) {
++    UINTN want=size-done;
++    status=file->Read(file,&want,Out+done);
++    if(!EFI_ERROR(status)) {if(!want)status=EFI_END_OF_FILE;else done+=want;}
++  }
++  EFI_STATUS closed=file->Close(file);
++  if(EFI_ERROR(status))return status;
++  if(EFI_ERROR(closed))return closed;
++  Out[size]=0;*Length=size;return EFI_SUCCESS;
++}
++/* Create a new file in \GPU-UNLOCK, verify it by reading it back; refuses to overwrite. */
++EFI_STATUS GuSaveParentBlob(CHAR16 *Name,const VOID *Data,UINTN Size) {
++  EFI_FILE_PROTOCOL *saved=Run;EFI_STATUS status;
++  if(!Parent)return EFI_NOT_READY;
++  Run=Parent;status=GuSaveBlob(Name,Data,Size);Run=saved;
++  return status;
++}
++#endif
+ EFI_STATUS GuLoadAssets(VOID) {
+   for(UINTN i=0;i<5;i++) {
+     EFI_FILE_PROTOCOL *file=NULL;const ASSET_SPEC *spec=&Specs[i];
+diff --git a/windows/uefi/app_io.h b/windows/uefi/app_io.h
+index b31f0c5..0b1e9a0 100644
+--- a/windows/uefi/app_io.h
++++ b/windows/uefi/app_io.h
+@@ -6,6 +6,10 @@ EFI_STATUS GuIoClose(VOID);
+ EFI_STATUS GuLoadAssets(VOID);
+ EFI_STATUS GuSavePromDump(const VOID *Data,UINTN Size);
+ EFI_STATUS GuSaveBlob(CHAR16 *Name,const VOID *Data,UINTN Size);
++#ifdef GU_GENERIC
++EFI_STATUS GuReadParentFile(CHAR16 *Name,char *Out,UINTN Max,UINTN *Length);
++EFI_STATUS GuSaveParentBlob(CHAR16 *Name,const VOID *Data,UINTN Size);
++#endif
+ VOID GuReleaseAssets(VOID);
+ BOOLEAN GuLogReady(VOID);
+ extern BOOLEAN GuScreenDetached;
